@@ -22,6 +22,7 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
+#include <memory>
 
 #include "nixl.h"
 #include "backend/backend_engine.h"
@@ -32,7 +33,7 @@
 #include "ucx/ucx_utils.h"
 #include "common/list_elem.h"
 
-typedef enum {CONN_CHECK, NOTIF_STR, DISCONNECT} ucx_cb_op_t;
+enum ucx_cb_op_t {CONN_CHECK, NOTIF_STR, DISCONNECT};
 
 struct nixl_ucx_am_hdr {
     ucx_cb_op_t op;
@@ -41,10 +42,13 @@ struct nixl_ucx_am_hdr {
 class nixlUcxConnection : public nixlBackendConnMD {
     private:
         std::string remoteAgent;
-        nixlUcxEp ep;
-        volatile bool connected;
+        // NOTE: nixlUcxEp object must be alive as long as ucp_ep_h is alive
+        //       since the object is passed to ucp_ep_create_nbx as err_cb
+        //       argument.
+        std::shared_ptr<nixlUcxEp> ep = std::make_shared<nixlUcxEp>();
 
     public:
+        nixlUcxEp& getEp() { return *ep; }
         // Extra information required for UCX connections
 
     friend class nixlUcxEngine;
@@ -92,11 +96,10 @@ class nixlUcxPublicMetadata : public nixlBackendMD {
 class nixlUcxCudaCtx;
 class nixlUcxEngine : public nixlBackendEngine {
     private:
-
         /* UCX data */
-        nixlUcxContext* uc;
-        nixlUcxWorker* uw;
-        void* workerAddr;
+        std::unique_ptr<nixlUcxContext> uc;
+        std::unique_ptr<nixlUcxWorker> uw;
+        std::unique_ptr<char []> workerAddr;
         size_t workerSize;
 
         /* Progress thread data */
@@ -106,7 +109,7 @@ class nixlUcxEngine : public nixlBackendEngine {
         nixlTime::us_t pthrDelay;
 
         /* CUDA data*/
-        nixlUcxCudaCtx *cudaCtx;
+        std::unique_ptr<nixlUcxCudaCtx> cudaCtx;
         bool cuda_addr_wa;
 
         /* Notifications */
@@ -118,31 +121,10 @@ class nixlUcxEngine : public nixlBackendEngine {
         std::unordered_map<std::string, nixlUcxConnection,
                            std::hash<std::string>, strEqual> remoteConnMap;
 
-        class nixlUcxBckndReq : public nixlLinkElem<nixlUcxBckndReq>, public nixlBackendReqH {
-            private:
-                int _completed;
-            public:
-                std::string *amBuffer;
-
-                nixlUcxBckndReq() : nixlLinkElem(), nixlBackendReqH() {
-                    _completed = 0;
-                    amBuffer = NULL;
-                }
-
-                ~nixlUcxBckndReq() {
-                    _completed = 0;
-                    if (amBuffer) {
-                        delete amBuffer;
-                    }
-                }
-
-                bool is_complete() { return _completed; }
-                void completed() { _completed = 1; }
-        };
 
         void vramInitCtx();
         void vramFiniCtx();
-        int vramUpdateCtx(void *address, uint32_t  devId, bool &restart_reqd);
+        int vramUpdateCtx(void *address, uint64_t devId, bool &restart_reqd);
         int vramApplyCtx();
 
         // Threading infrastructure
@@ -153,13 +135,6 @@ class nixlUcxEngine : public nixlBackendEngine {
         void progressThreadRestart();
         bool isProgressThread(){
             return (std::this_thread::get_id() == pthr.get_id());
-        }
-
-        // Request management
-        static void _requestInit(void *request);
-        static void _requestFini(void *request);
-        void requestReset(nixlUcxBckndReq *req) {
-            _requestInit((void *)req);
         }
 
         // Connection helper
@@ -190,10 +165,6 @@ class nixlUcxEngine : public nixlBackendEngine {
         void notifProgress();
         void notifCombineHelper(notif_list_t &src, notif_list_t &tgt);
         void notifProgressCombineHelper(notif_list_t &src, notif_list_t &tgt);
-
-
-        // Data transfer (priv)
-        nixl_status_t retHelper(nixl_status_t ret, nixlUcxBckndReq *head, nixlUcxReq &req);
 
     public:
         nixlUcxEngine(const nixlBackendInitParams* init_params);

@@ -13,7 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-nixl_lib_deps = [nixl_infra, serdes_interface]
+# Add dependency on the common utility library which brings in logging deps
+
+nixl_lib_deps = [nixl_infra, serdes_interface, stream_interface, dl_dep, nixl_common_dep, thread_dep]
+
+if etcd_dep.found()
+    nixl_lib_deps += [ etcd_dep ]
+endif
 
 if 'UCX' in static_plugins
     nixl_lib_deps += [ ucx_backend_interface, cuda_dep ]
@@ -23,16 +29,28 @@ if 'UCX_MO' in static_plugins
     nixl_lib_deps += [ ucx_mo_backend_interface, cuda_dep ]
 endif
 
+if 'POSIX' in static_plugins
+    nixl_lib_deps += [ posix_backend_interface ]
+endif
 
 disable_gds_backend = get_option('disable_gds_backend')
-if not disable_gds_backend and cuda_dep.found()
+if not disable_gds_backend and 'GDS' in static_plugins
     nixl_lib_deps += [ gds_backend_interface, cuda_dep ]
+endif
+
+cc = meson.get_compiler('cpp')
+libtransfer_engine = cc.find_library('transfer_engine', required: false)
+disable_mooncake_backend = get_option('disable_mooncake_backend')
+if libtransfer_engine.found() and not disable_mooncake_backend and 'Mooncake' in static_plugins
+    nixl_lib_deps += [ mooncake_backend_interface, cuda_dep ]
 endif
 
 nixl_lib = library('nixl',
                    'nixl_agent.cpp',
                    'nixl_plugin_manager.cpp',
+                   'nixl_listener.cpp',
                    include_directories: [ nixl_inc_dirs, utils_inc_dirs ],
+                   link_args: ['-lstdc++fs'],
                    dependencies: nixl_lib_deps,
                    install: true)
 

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-project('nixl', 'CPP', version: '0.1.1',
+project('nixl', 'CPP', version: '0.2.1',
     default_options: ['buildtype=debug',
                 'werror=true',
                 'cpp_std=c++17',
@@ -23,6 +23,19 @@ project('nixl', 'CPP', version: '0.1.1',
 
 # set up some global vars for compiler, platform, configuration, etc.
 cpp = meson.get_compiler('cpp')
+
+dl_dep = cpp.find_library('dl', required: true)
+thread_dep = dependency('threads')
+
+# Forced to ignore this error due to:
+# https://github.com/abseil/abseil-cpp/issues/1779
+# This must be global since subprojects cannot be assigned with arguments.
+# Adding this configuration only for release build to consider it while developing.
+if get_option('buildtype') == 'release'
+  abseil_flags = cpp.get_supported_arguments('-Wno-error=maybe-uninitialized', '-Wno-maybe-uninitialized')
+  add_global_arguments(abseil_flags, language: 'cpp')
+endif
+abseil_proj = subproject('abseil-cpp')
 
 cuda_inc_path = get_option('cudapath_inc')
 cuda_lib_path = get_option('cudapath_lib')
@@ -41,6 +54,29 @@ else
     include_directories : include_directories(cuda_inc_path))
 endif
 
+# Check for etcd-cpp-api - use multiple methods for discovery
+etcd_dep = dependency('etcd-cpp-api', required : false)
+etcd_inc_path = get_option('etcd_inc_path')
+etcd_lib_path = get_option('etcd_lib_path')
+if not etcd_dep.found() and etcd_lib_path != ''
+    etcd_lib = cpp.find_library('etcd-cpp-api')
+    if etcd_lib.found()
+        if cpp.has_header('Client.hpp', args : '-I' + etcd_inc_path)
+            etcd_inc = include_directories(etcd_inc_path, is_system: true)
+            etcd_dep = declare_dependency(
+                        include_directories : etcd_inc,
+                        dependencies : etcd_lib)
+            break
+        endif
+    endif
+endif
+
+if etcd_dep.found()
+    add_project_arguments('-DHAVE_ETCD', language: 'cpp')
+else
+    message('ETCD CPP API library not found, will disable etcd support')
+endif
+
 prefix_path = get_option('prefix')
 prefix_inc = prefix_path + '/include'
 
@@ -57,6 +93,12 @@ endif
 
 if get_option('disable_gds_backend')
     add_project_arguments('-DDISABLE_GDS_BACKEND', language: 'cpp')
+endif
+
+# Configure NDEBUG for release builds
+if get_option('buildtype') == 'release'
+    # Used by Abseil to strip DCHECK assertions and DVLOG at compile time
+    add_project_arguments('-DNDEBUG', language: 'cpp')
 endif
 
 static_plugins = []
@@ -79,6 +121,8 @@ plugin_build_dir = meson.current_build_dir()
 # Add to global args so plugin managers can find it
 if get_option('buildtype') == 'debug'
     add_project_arguments('-DNIXL_USE_PLUGIN_FILE="' + plugin_build_dir + '/pluginlist"',  language: 'cpp')
+    plugfile = join_paths(plugin_build_dir, 'pluginlist')
+    run_command('truncate', '-s 0', plugfile, check: true)
 endif
 
 nixl_inc_dirs = include_directories('src/api/cpp', 'src/infra', 'src/core')

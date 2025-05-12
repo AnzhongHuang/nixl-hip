@@ -56,6 +56,61 @@ static uint32_t _getNumVramDevices(){
 #endif
 
 /****************************************
+ * UCX/MO Request management
+*****************************************/
+
+class nixlUcxMoRequestH : public nixlBackendReqH {
+private:
+
+    class dlMatrixElem {
+    public:
+        bool in_use, in_progress;
+        nixl_meta_dlist_t *ldescs;
+        nixl_meta_dlist_t *rdescs;
+        nixlBackendReqH *ucx_req;
+
+        dlMatrixElem() {
+            in_use = false;
+            in_progress = false;
+            ldescs = nullptr;
+            rdescs = nullptr;
+            ucx_req = nullptr;
+        }
+    };
+
+    using dl_matrix_t = std::vector<std::vector<dlMatrixElem>>;
+
+    dl_matrix_t dlMatrix;
+
+    std::string remoteAgent;
+    bool notifNeed;
+    std::string notifMsg;
+public:
+    nixlUcxMoRequestH(size_t l_eng_cnt, size_t r_eng_cnt) :
+        dlMatrix(l_eng_cnt, std::vector<dlMatrixElem>(r_eng_cnt, dlMatrixElem()))
+    {
+        notifNeed = false;
+    }
+
+    ~nixlUcxMoRequestH()
+    {
+        for (auto &row : dlMatrix) {
+            for (auto &p : row) {
+                if (p.ldescs) {
+                    delete p.ldescs;
+                }
+                if (p.rdescs) {
+                    delete p.rdescs;
+                }
+            }
+        }
+    }
+
+    friend class nixlUcxMoEngine;
+};
+
+
+/****************************************
  * UCX Engine management
 *****************************************/
 
@@ -75,7 +130,7 @@ nixlUcxMoEngine::getEngCnt()
 }
 
 int32_t
-nixlUcxMoEngine::getEngIdx(nixl_mem_t type, uint32_t devId)
+nixlUcxMoEngine::getEngIdx(nixl_mem_t type, uint64_t devId)
 {
     switch (type) {
     case VRAM_SEG:
@@ -134,14 +189,13 @@ nixlUcxMoEngine::nixlUcxMoEngine(const nixlBackendInitParams* init_params):
     setEngCnt(num_ucx_engines);
     // Initialize required number of engines
     for (uint32_t i = 0; i < getEngCnt(); i++) {
-        nixlBackendEngine *e;
-        e = (nixlBackendEngine *)new nixlUcxEngine(init_params);
-        engines.push_back(e);
-        if (engines[0]->getInitErr()) {
+        auto e = std::make_unique<nixlUcxEngine>(init_params);
+        if (e->getInitErr()) {
             this->initErr = true;
             // TODO: Log error
             return;
         }
+        engines.push_back(std::move(e));
     }
 }
 
@@ -151,13 +205,6 @@ nixlUcxMoEngine::getSupportedMems () const {
     mems.push_back(DRAM_SEG);
     mems.push_back(VRAM_SEG);
     return mems;
-}
-
-nixlUcxMoEngine::~nixlUcxMoEngine()
-{
-    for( auto &e : engines ) {
-        delete e;
-    }
 }
 
 /****************************************
@@ -296,7 +343,7 @@ nixlUcxMoEngine::registerMem (const nixlBlobDesc &mem,
                               const nixl_mem_t &nixl_mem,
                               nixlBackendMD* &out)
 {
-    nixlUcxMoPrivateMetadata *priv = new nixlUcxMoPrivateMetadata;
+    auto priv = std::make_unique<nixlUcxMoPrivateMetadata>();
     int32_t eidx = getEngIdx(nixl_mem, mem.devId);
     nixlSerDes sd;
     string str;
@@ -317,7 +364,7 @@ nixlUcxMoEngine::registerMem (const nixlBlobDesc &mem,
     }
     sd.addStr("RkeyStr", str);
     priv->rkeyStr = sd.exportStr();
-    out = (nixlBackendMD*) priv;
+    out = priv.release();
 
     return NIXL_SUCCESS;
 }
@@ -354,7 +401,7 @@ nixlUcxMoEngine::internalMDHelper (const nixl_blob_t &blob,
     nixl_status_t status;
     nixlBlobDesc input_int;
 
-    nixlUcxMoPublicMetadata *md = new nixlUcxMoPublicMetadata;
+    auto md = std::make_unique<nixlUcxMoPublicMetadata>();
 
     auto search = remoteConnMap.find(agent);
 
@@ -362,7 +409,7 @@ nixlUcxMoEngine::internalMDHelper (const nixl_blob_t &blob,
         //TODO: err: remote connection not found
         return NIXL_ERR_NOT_FOUND;
     }
-    conn = (nixlUcxMoConnection) search->second;
+    conn = search->second;
 
     status = sd.importStr(blob);
 
@@ -393,7 +440,7 @@ nixlUcxMoEngine::internalMDHelper (const nixl_blob_t &blob,
         md->int_mds.push_back(int_md);
     }
 
-    output = (nixlBackendMD*)md;
+    output = md.release();
     return NIXL_SUCCESS;
 }
 
@@ -433,37 +480,6 @@ nixlUcxMoEngine::unloadMD (nixlBackendMD* input)
  * Data movement
 *****************************************/
 
-void
-nixlUcxMoEngine::cancelRequests(nixlUcxMoRequestH *req)
-{
-    // Iterate over all elements cancelling each one
-    for ( auto &p : req->reqs ) {
-        p.first->releaseReqH(p.second);
-        p.first = NULL;
-        p.second = NULL;
-    }
-}
-
-
-nixl_status_t
-nixlUcxMoEngine::retHelper(nixl_status_t ret, nixlBackendEngine *eng,
-                           nixlUcxMoRequestH *req, nixlBackendReqH *&int_req)
-{
-    /* if transfer wasn't immediately completed */
-    switch(ret) {
-    case NIXL_IN_PROG:
-        req->reqs.push_back(nixlUcxMoRequestH::req_pair_t{eng, int_req});
-    case NIXL_SUCCESS:
-        // Nothing to do
-        return NIXL_SUCCESS;
-    default:
-        // Error. Release all previously initiated ops and exit:
-        cancelRequests(req);
-        delete(req);
-        return ret;
-    }
-}
-
 nixl_status_t
 nixlUcxMoEngine::prepXfer (const nixl_xfer_op_t &operation,
                            const nixl_meta_dlist_t &local,
@@ -472,6 +488,9 @@ nixlUcxMoEngine::prepXfer (const nixl_xfer_op_t &operation,
                            nixlBackendReqH* &handle,
                            const nixl_opt_b_args_t *opt_args)
 {
+    size_t lidx, ridx;
+    size_t lidx_max, ridx_max;
+
     // Number of local and remote descriptors must match
     int des_cnt = local.descCount();
     if (des_cnt != remote.descCount()) {
@@ -498,7 +517,7 @@ nixlUcxMoEngine::prepXfer (const nixl_xfer_op_t &operation,
     size_t l_eng_cnt = engines.size();
     size_t r_eng_cnt = conn.num_engines;
 
-    nixlUcxMoRequestH *req = new nixlUcxMoRequestH(l_eng_cnt, r_eng_cnt);
+    auto req = std::make_unique<nixlUcxMoRequestH>(l_eng_cnt, r_eng_cnt);
 
     /* Go over all input */
     for(int i = 0; i < des_cnt; i++) {
@@ -511,41 +530,81 @@ nixlUcxMoEngine::prepXfer (const nixl_xfer_op_t &operation,
         size_t lidx = lmd->eidx;
         size_t ridx = rmd->eidx;
 
-        assert( (lidx < l_eng_cnt) && (ridx < r_eng_cnt));
         if (!((lidx < l_eng_cnt) && (ridx < r_eng_cnt))) {
             // TODO: err output
-            goto error;
+            goto err_clean_req;
         }
         if (lsize != rsize) {
             // TODO: err output
-            goto error;
+            goto err_clean_req;
         }
 
         /* Allocate internal dlists if needed */
-        if (NULL == req->dlMatrix[lidx][ridx].first) {
-            req->dlMatrix[lidx][ridx].first = new nixl_meta_dlist_t (
+        if (!req->dlMatrix[lidx][ridx].in_use) {
+            req->dlMatrix[lidx][ridx].in_use = true;
+            req->dlMatrix[lidx][ridx].ldescs = new nixl_meta_dlist_t (
                                                 local.getType(),
                                                 local.isSorted());
 
-            req->dlMatrix[lidx][ridx].second = new nixl_meta_dlist_t (
+            req->dlMatrix[lidx][ridx].rdescs = new nixl_meta_dlist_t (
                                                 remote.getType(),
                                                 remote.isSorted());
         }
 
         nixlMetaDesc ldesc = local[i];
         ldesc.metadataP = lmd->md;
-        req->dlMatrix[lidx][ridx].first->addDesc(ldesc);
+        req->dlMatrix[lidx][ridx].ldescs->addDesc(ldesc);
 
         nixlMetaDesc rdesc = remote[i];
         rdesc.metadataP = rmd->int_mds[lidx];
-        req->dlMatrix[lidx][ridx].second->addDesc(rdesc);
+        req->dlMatrix[lidx][ridx].rdescs->addDesc(rdesc);
     }
 
-    handle = req;
+    // Prepare UCX requests!
+    for(lidx = 0; lidx < req->dlMatrix.size(); lidx++) {
+        for(ridx = 0; ridx < req->dlMatrix[lidx].size(); ridx++) {
+            nixl_status_t ret;
+
+            if (!req->dlMatrix[lidx][ridx].in_use) {
+                // Skip unused matrix elements
+                continue;
+            }
+            ret = engines[lidx]->prepXfer(operation,
+                                          *req->dlMatrix[lidx][ridx].ldescs,
+                                          *req->dlMatrix[lidx][ridx].rdescs,
+                                          getEngName(remote_agent, ridx),
+                                          req->dlMatrix[lidx][ridx].ucx_req);
+            if (NIXL_SUCCESS != ret) {
+                goto err_clean_sub_req;
+            }
+        }
+    }
+
+    handle = req.release();
 
     return NIXL_SUCCESS;
-error:
-    delete req;
+
+err_clean_sub_req:
+    /* Release only allocated requests */
+    lidx_max = lidx + 1;
+    ridx_max = ridx;
+    for(lidx = 0; lidx < lidx_max; lidx++) {
+        for(ridx = 0; ridx < ridx_max; ridx++) {
+            nixl_status_t ret;
+
+            if (!req->dlMatrix[lidx][ridx].in_use) {
+                // Skip unused matrix elements
+                continue;
+            }
+
+            engines[lidx]->releaseReqH(req->dlMatrix[lidx][ridx].ucx_req);
+            if (NIXL_SUCCESS != ret) {
+                // TODO: Output error, but still continue trying to fix others
+            }
+        }
+    }
+
+err_clean_req:
     return NIXL_ERR_INVALID_PARAM;
 }
 
@@ -560,24 +619,33 @@ nixlUcxMoEngine::postXfer (const nixl_xfer_op_t &operation,
                            const nixl_opt_b_args_t *opt_args)
 {
     nixlUcxMoRequestH *req = (nixlUcxMoRequestH *)handle;
+    bool in_progress = false;
 
     for(size_t lidx = 0; lidx < req->dlMatrix.size(); lidx++) {
         for(size_t ridx = 0; ridx < req->dlMatrix[lidx].size(); ridx++) {
-            string no_notif_msg;
-            nixlBackendReqH *int_req;
             nixl_status_t ret;
 
-            if (NULL == req->dlMatrix[lidx][ridx].first) {
+            if (!req->dlMatrix[lidx][ridx].in_use) {
                 // Skip unused matrix elements
                 continue;
             }
+
             ret = engines[lidx]->postXfer(operation,
-                                          *req->dlMatrix[lidx][ridx].first,
-                                          *req->dlMatrix[lidx][ridx].second,
+                                          *req->dlMatrix[lidx][ridx].ldescs,
+                                          *req->dlMatrix[lidx][ridx].rdescs,
                                           getEngName(remote_agent, ridx),
-                                          int_req);
-            ret = retHelper(ret, engines[lidx], req, int_req);
-            if (NIXL_SUCCESS != ret) {
+                                          req->dlMatrix[lidx][ridx].ucx_req);
+
+            /* if transfer wasn't immediately completed */
+            switch(ret) {
+            case NIXL_IN_PROG:
+                req->dlMatrix[lidx][ridx].in_progress = true;
+                in_progress = true;
+            case NIXL_SUCCESS:
+                // Nothing to do
+                break;
+            default:
+                // Error.
                 return ret;
             }
         }
@@ -589,15 +657,28 @@ nixlUcxMoEngine::postXfer (const nixl_xfer_op_t &operation,
         // as we need to chose one of the workers to send it,
         // but we can only be sent after all workers are flushed.
         // Instead, we will initiate Notification from the CheckXfer
-        req->notifNeed = true;
-        req->notifMsg = opt_args->notifMsg;
-        req->remoteAgent = remote_agent;
+
+        if (!in_progress) {
+
+        } else {
+            req->notifNeed = true;
+            req->notifMsg = opt_args->notifMsg;
+            req->remoteAgent = remote_agent;
+        }
     }
 
-    if (req->reqs.size()) {
+    if (in_progress) {
         return NIXL_IN_PROG;
     } else {
-        delete req;
+        if(req->notifNeed) {
+            nixl_status_t ret;
+
+            ret = engines[0]->genNotif(getEngName(req->remoteAgent, 0), req->notifMsg);
+            if (NIXL_SUCCESS != ret) {
+                /* Return error, TODO: add output */
+                return ret;
+            }
+        }
         return  NIXL_SUCCESS;
     }
 }
@@ -606,27 +687,30 @@ nixl_status_t
 nixlUcxMoEngine::checkXfer (nixlBackendReqH *handle)
 {
     nixlUcxMoRequestH *req = (nixlUcxMoRequestH *)handle;
-    nixlUcxMoRequestH::req_list_t &l = req->reqs;
-    nixlUcxMoRequestH::req_list_it_t it;
     nixl_status_t out_ret = NIXL_SUCCESS;
 
-    for (it = l.begin(); it != l.end(); ) {
-        nixl_status_t ret;
+    for(size_t lidx = 0; lidx < req->dlMatrix.size(); lidx++) {
+        for(size_t ridx = 0; ridx < req->dlMatrix[lidx].size(); ridx++) {
+            nixl_status_t ret;
 
-        ret = it->first->checkXfer(it->second);
-        switch (ret) {
-        case NIXL_SUCCESS:
-            /* Mark as completed */
-            it->first->releaseReqH(it->second);
-            it = l.erase(it);
-            break;
-        case NIXL_IN_PROG:
-            out_ret = NIXL_IN_PROG;
-            it++;
-            break;
-        default:
-            /* Any other ret value is unexpected */
-            return ret;
+            if (!req->dlMatrix[lidx][ridx].in_progress) {
+                // Skip not-in-progress matrix elements
+                continue;
+            }
+
+            ret = engines[lidx]->checkXfer(req->dlMatrix[lidx][ridx].ucx_req);
+            switch (ret) {
+            case NIXL_SUCCESS:
+                /* Mark as completed */
+                req->dlMatrix[lidx][ridx].in_progress = false;
+                break;
+            case NIXL_IN_PROG:
+                out_ret = NIXL_IN_PROG;
+                break;
+            default:
+                /* Any other ret value is unexpected */
+                return ret;
+            }
         }
     }
 
@@ -637,7 +721,7 @@ nixlUcxMoEngine::checkXfer (nixlBackendReqH *handle)
         // it is safe to send Notification
         ret = engines[0]->genNotif(getEngName(req->remoteAgent, 0), req->notifMsg);
         if (NIXL_SUCCESS != ret) {
-            /* Mark as completed */
+            /* Return error, TODO: add output */
             return ret;
         }
     }
@@ -648,8 +732,27 @@ nixlUcxMoEngine::checkXfer (nixlBackendReqH *handle)
 nixl_status_t
 nixlUcxMoEngine::releaseReqH(nixlBackendReqH* handle)
 {
-    cancelRequests((nixlUcxMoRequestH *)handle);
-    return NIXL_SUCCESS;
+    nixlUcxMoRequestH *req = (nixlUcxMoRequestH *)handle;
+    nixl_status_t out_ret = NIXL_SUCCESS;
+
+    for(size_t lidx = 0; lidx < req->dlMatrix.size(); lidx++) {
+        for(size_t ridx = 0; ridx < req->dlMatrix[lidx].size(); ridx++) {
+            nixl_status_t ret;
+
+            if (!req->dlMatrix[lidx][ridx].in_use) {
+                // Skip unused matrix elements
+                continue;
+            }
+
+            ret = engines[lidx]->releaseReqH(req->dlMatrix[lidx][ridx].ucx_req);
+            if (NIXL_SUCCESS != ret) {
+                // TODO: Output error, but still continue trying to fix others
+                out_ret = ret;
+            }
+        }
+    }
+
+    return out_ret;
 }
 
 int
