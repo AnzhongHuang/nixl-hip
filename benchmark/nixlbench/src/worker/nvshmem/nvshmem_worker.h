@@ -20,11 +20,12 @@
 
 #include "config.h"
 #include "worker/worker.h"
-
+#include <array>
 #if HAVE_NVSHMEM && HAVE_CUDA
-#include <nvshmem.h>
-#include <nvshmemx.h>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime_api.h>
+#include <hip/hip_runtime.h>
+#include <rocshmem/rocshmem.hpp>
+using namespace rocshmem;
 
 class xferBenchNvshmemWorker: public xferBenchWorker {
     private:
@@ -33,8 +34,8 @@ class xferBenchNvshmemWorker: public xferBenchWorker {
         int size;
 
         // CUDA stream
-        cudaStream_t stream;
-        nvshmemx_uniqueid_t group_id;
+        hipStream_t stream;
+        rocshmem_uniqueid_t group_id;
         int group_id_initialized = 0;
 
     public:

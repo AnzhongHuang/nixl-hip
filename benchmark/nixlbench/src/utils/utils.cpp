@@ -24,7 +24,7 @@
 #include <iomanip>
 #include <omp.h>
 #if HAVE_CUDA
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #endif
 
 #include "runtime/etcd/etcd_rt.h"
@@ -337,8 +337,8 @@ void xferBenchUtils::checkConsistency(std::vector<std::vector<xferBenchIOV>> &io
                  xferBenchConfig::initiator_seg_type == XFERBENCH_SEG_TYPE_VRAM)) {
 #if HAVE_CUDA
                 addr = calloc(1, len);
-                CHECK_CUDA_ERROR(cudaMemcpy(addr, (void *)iov.addr, len,
-                                          cudaMemcpyDeviceToHost), "cudaMemcpy failed");
+                CHECK_CUDA_ERROR(hipMemcpy(addr, (void *)iov.addr, len,
+                                          hipMemcpyDeviceToHost), "hipMemcpy failed");
 #else
                 std::cerr << "Failure in consistency check: VRAM segment type not supported without CUDA"
                           << std::endl;

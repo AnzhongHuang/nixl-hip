@@ -28,23 +28,23 @@
 #include "runtime/runtime.h"
 
 #if HAVE_CUDA
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
 
 #define CHECK_CUDA_ERROR(result, message)                                           \
     do {                                                                            \
-        if (result != cudaSuccess) {                                                \
+        if (result != hipSuccess) {                                                \
             std::cerr << "CUDA: " << message << " (Error code: " << result          \
-                      << " - " << cudaGetErrorString(result) << ")" << std::endl;   \
+                      << " - " << hipGetErrorString(result) << ")" << std::endl;   \
             exit(EXIT_FAILURE);                                                     \
         }                                                                           \
     } while(0)
 
 #define CHECK_CUDA_DRIVER_ERROR(result, message)                                    \
     do {                                                                            \
-        if (result != CUDA_SUCCESS) {                                               \
+        if (result != hipSuccess) {                                               \
             const char *error_str;                                                  \
-            cuGetErrorString(result, &error_str);                                   \
+            hipDrvGetErrorString(result, &error_str);                                   \
             std::cerr << "CUDA Driver: " << message << " (Error code: "             \
                       << result << " - " << error_str << ")" << std::endl;          \
             exit(EXIT_FAILURE);                                                     \

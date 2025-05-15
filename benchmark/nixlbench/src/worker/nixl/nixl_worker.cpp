@@ -18,8 +18,8 @@
 #include "worker/nixl/nixl_worker.h"
 #include <cstring>
 #if HAVE_CUDA
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
 #endif
 #include <fcntl.h>
 #include <filesystem>
@@ -41,7 +41,7 @@ static std::vector<std::vector<xferBenchIOV>> gds_remote_iovs;
 
 #if HAVE_CUDA
 static size_t __attribute__((unused)) padded_size = 0;
-static CUmemGenericAllocationHandle __attribute__((unused)) handle;
+static hipMemGenericAllocationHandle_t __attribute__((unused)) handle;
 #endif
 
 #define CHECK_NIXL_ERROR(result, message)                                         \
@@ -212,62 +212,62 @@ static std::optional<xferBenchIOV> getVramDesc(int devid, size_t buffer_size,
 {
     void *addr;
 
-    CHECK_CUDA_ERROR(cudaSetDevice(devid), "Failed to set device");
+    CHECK_CUDA_ERROR(hipSetDevice(devid), "Failed to set device");
 #if !USE_VMM
-    CHECK_CUDA_ERROR(cudaMalloc(&addr, buffer_size), "Failed to allocate CUDA buffer");
+    CHECK_CUDA_ERROR(hipMalloc(&addr, buffer_size), "Failed to allocate CUDA buffer");
     if (isInit) {
-        CHECK_CUDA_ERROR(cudaMemset(addr, XFERBENCH_INITIATOR_BUFFER_ELEMENT, buffer_size), "Failed to set device");
+        CHECK_CUDA_ERROR(hipMemset(addr, XFERBENCH_INITIATOR_BUFFER_ELEMENT, buffer_size), "Failed to set device");
 
     } else {
-        CHECK_CUDA_ERROR(cudaMemset(addr, XFERBENCH_TARGET_BUFFER_ELEMENT, buffer_size), "Failed to set device");
+        CHECK_CUDA_ERROR(hipMemset(addr, XFERBENCH_TARGET_BUFFER_ELEMENT, buffer_size), "Failed to set device");
     }
 #else
-    CUdeviceptr addr = 0;
+    hipDeviceptr_t addr = 0;
     size_t granularity = 0;
-    CUmemAllocationProp prop = {};
-    CUmemAccessDesc access = {};
+    hipMemAllocationProp prop = {};
+    hipMemAccessDesc access = {};
 
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.type = hipMemAllocationTypePinned;
     // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
     prop.allocFlags.gpuDirectRDMACapable = 1;
     prop.location.id = devid;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.type = hipMemLocationTypeDevice;
     // prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
 
     // Get the allocation granularity
-    CHECK_CUDA_DRIVER_ERROR(cuMemGetAllocationGranularity(&granularity,
-                         &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+    CHECK_CUDA_DRIVER_ERROR(hipMemGetAllocationGranularity(&granularity,
+                         &prop, hipMemAllocationGranularityMinimum),
                          "Failed to get allocation granularity");
     std::cout << "Granularity: " << granularity << std::endl;
 
     padded_size = ROUND_UP(buffer_size, granularity);
-    CHECK_CUDA_DRIVER_ERROR(cuMemCreate(&handle, padded_size, &prop, 0),
+    CHECK_CUDA_DRIVER_ERROR(hipMemCreate(&handle, padded_size, &prop, 0),
                          "Failed to create allocation");
 
     // Reserve the memory address
-    CHECK_CUDA_DRIVER_ERROR(cuMemAddressReserve(&addr, padded_size,
+    CHECK_CUDA_DRIVER_ERROR(hipMemAddressReserve(&addr, padded_size,
                          granularity, 0, 0), "Failed to reserve address");
 
     // Map the memory
-    CHECK_CUDA_DRIVER_ERROR(cuMemMap(addr, padded_size, 0, handle, 0),
+    CHECK_CUDA_DRIVER_ERROR(hipMemMap(addr, padded_size, 0, handle, 0),
                          "Failed to map memory");
 
     std::cout << "Address: " << std::hex << std::showbase << addr
               << " Buffer size: " << std::dec << buffer_size
               << " Padded size: " << std::dec << padded_size << std::endl;
     // Set the memory access rights
-    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.type = hipMemLocationTypeDevice;
     access.location.id = devid;
-    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    CHECK_CUDA_DRIVER_ERROR(cuMemSetAccess(addr, buffer_size, &access, 1),
+    access.flags = hipMemAccessFlagsProtReadWrite;
+    CHECK_CUDA_DRIVER_ERROR(hipMemSetAccess(addr, buffer_size, &access, 1),
         "Failed to set access");
 
     // Set memory content based on role
     if (isInit) {
-        CHECK_CUDA_DRIVER_ERROR(cuMemsetD8(addr, XFERBENCH_INITIATOR_BUFFER_ELEMENT, buffer_size),
+        CHECK_CUDA_DRIVER_ERROR(hipMemsetD8(addr, XFERBENCH_INITIATOR_BUFFER_ELEMENT, buffer_size),
             "Failed to set device memory to XFERBENCH_INITIATOR_BUFFER_ELEMENT");
     } else {
-        CHECK_CUDA_DRIVER_ERROR(cuMemsetD8(addr, XFERBENCH_TARGET_BUFFER_ELEMENT, buffer_size),
+        CHECK_CUDA_DRIVER_ERROR(hipMemsetD8(addr, XFERBENCH_TARGET_BUFFER_ELEMENT, buffer_size),
             "Failed to set device memory to XFERBENCH_TARGET_BUFFER_ELEMENT");
     }
 #endif /* !USE_VMM */
@@ -327,15 +327,15 @@ void xferBenchNixlWorker::cleanupBasicDescDram(xferBenchIOV &iov) {
 
 #if HAVE_CUDA
 void xferBenchNixlWorker::cleanupBasicDescVram(xferBenchIOV &iov) {
-    CHECK_CUDA_ERROR(cudaSetDevice(iov.devId), "Failed to set device");
+    CHECK_CUDA_ERROR(hipSetDevice(iov.devId), "Failed to set device");
 #if !USE_VMM
-    CHECK_CUDA_ERROR(cudaFree((void *)iov.addr), "Failed to deallocate CUDA buffer");
+    CHECK_CUDA_ERROR(hipFree((void *)iov.addr), "Failed to deallocate CUDA buffer");
 #else
-    CHECK_CUDA_DRIVER_ERROR(cuMemUnmap(iov.addr, iov.len),
+    CHECK_CUDA_DRIVER_ERROR(hipMemUnmap(iov.addr, iov.len),
                          "Failed to unmap memory");
-    CHECK_CUDA_DRIVER_ERROR(cuMemRelease(handle),
+    CHECK_CUDA_DRIVER_ERROR(hipMemRelease(handle),
                          "Failed to release memory");
-    CHECK_CUDA_DRIVER_ERROR(cuMemAddressFree(iov.addr, padded_size), "Failed to free reserved address");
+    CHECK_CUDA_DRIVER_ERROR(hipMemAddressFree(iov.addr, padded_size), "Failed to free reserved address");
 #endif
 }
 #endif /* HAVE_CUDA */

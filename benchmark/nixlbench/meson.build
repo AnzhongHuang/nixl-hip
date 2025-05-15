@@ -14,7 +14,7 @@
 # limitations under the License.
 
 project('nixlbench', 'CPP', version: '0.2.0',
-    default_options: ['buildtype=release',
+    default_options: ['buildtype=debug',
                 'werror=true',
                 'cpp_std=c++17',
                 'prefix=/usr/local/nixlbench'],
@@ -37,6 +37,9 @@ nixl_path = get_option('nixl_path')
 # NVSHMEM
 nvshmem_inc_path = get_option('nvshmem_inc_path')
 nvshmem_lib_path = get_option('nvshmem_lib_path')
+# ompi
+ompi_lib_path = get_option('ompi_lib_path')
+ompi_inc_path = get_option('ompi_lib_path')
 
 # Find required libraries
 # NIXL
@@ -45,6 +48,7 @@ nixl_lib = cpp.find_library('nixl', dirs: [nixl_lib_path])
 nixl_build = cpp.find_library('nixl_build', dirs: [nixl_lib_path])
 nixl_serdes = cpp.find_library('serdes', dirs: [nixl_lib_path])
 
+
 if not nixl_lib.found() or not nixl_build.found() or not nixl_serdes.found()
     error('NIXL Libraries not found. Exiting.')
 endif
@@ -52,7 +56,7 @@ endif
 # CUDA
 cuda_available = false
 if cuda_lib_path == ''
-    cuda_dep = dependency('cuda', required : false, modules : [ 'cudart', 'cuda' ])
+    cuda_dep = dependency('cuda', required : false, modules : [ 'hiprtc', 'amdhip64' ])
     if cuda_dep.found()
         cuda_available = true
     endif
@@ -62,7 +66,7 @@ else
         cuda_stub_path = cuda_lib_path + '/stubs'
     endif
     cuda_dep = declare_dependency(
-        link_args : ['-L' + cuda_lib_path, '-L' + cuda_stub_path, '-lcuda', '-lcudart'],
+        link_args : ['-L' + cuda_lib_path, '-L' + cuda_stub_path, '-lamdhip64', '-lhiprtc'],
         include_directories : include_directories(cuda_inc_path))
     cuda_available = true
 endif
@@ -90,25 +94,28 @@ endif
 etcd_inc = etcd_inc_path
 nixl_inc = nixl_path + '/include'
 nvshmem_inc = nvshmem_inc_path
-
-inc_dir = include_directories('.', './src/', nixl_inc)
+ompi_inc = '/usr/local/ompi/include'
+inc_dir = include_directories('.', './src/', nixl_inc, ompi_inc)
 
 nvshmem_available = false
 if nvshmem_lib_path != ''
-    if cpp.has_header('nvshmem.h', include_directories: include_directories(nvshmem_inc))
-        nvshmem_lib = cpp.find_library('nvshmem', dirs: [nvshmem_lib_path])
-        nvshmem_host_lib = cpp.find_library('nvshmem_host', dirs: [nvshmem_lib_path])
+    if cpp.has_header('rocshmem/rocshmem.hpp', include_directories: include_directories(nvshmem_inc))
+        nvshmem_lib = cpp.find_library('rocshmem', dirs: [nvshmem_lib_path])
+        #nvshmem_host_lib = cpp.find_library('nvshmem_host', dirs: [nvshmem_lib_path])
         if nvshmem_lib.found()
             nvshmem_available = true
-            inc_dir = include_directories('.', './src/', nixl_inc, nvshmem_inc)
+            inc_dir = include_directories('.', './src/', nixl_inc, nvshmem_inc, ompi_inc)
             add_project_arguments('-DHAVE_NVSHMEM', language: 'cpp')
             add_project_arguments('-Wno-unused-variable', language: 'cpp')
+        else
+            message('cannot find nvshmem', nvshmem_lib_path)
         endif
     endif
 endif
 
 if cuda_available
     add_project_arguments('-DHAVE_CUDA', language: 'cpp')
+    add_project_arguments('-D__HIP_PLATFORM_AMD__', '-Wno-deprecated-declarations', '-Wno-unused-result', language: 'cpp')
 endif
 
 # Subprojects
@@ -140,10 +147,11 @@ if nvshmem_available
     deps += [nvshmem_lib]
     args += [
         '-Xcompiler', '-fopenmp',
-        '-Xlinker', '-rpath=/usr/local/cuda/lib64',
+        '-Xlinker', '-rpath=/opt/rocm/lib',
         '-Xlinker', '--allow-shlib-undefined',
-        '-lcudart',
-        '-lcudadevrt',
+        '-lamdhip64',
+        '-lhiprtc',
+        '-g', '-O0',
     ]
 endif
 
@@ -153,7 +161,7 @@ endif
 
 if nvshmem_available
     # Use nvcc directly for compilation and linking
-    nvcc = find_program('nvcc')
+    nvcc = find_program('hipcc')
     nvcc_args = []
     if etcd_available
         if etcd_inc != ''
@@ -161,6 +169,7 @@ if nvshmem_available
         endif
     endif
     nvcc_args += ['-I' + nixl_inc]
+    nvcc_args += ['-I' + ompi_inc]
     nvcc_args += ['-I' + nvshmem_inc]
     nvcc_args += ['-I.', '-I./src/', '-I../src/']
     nvcc_args += ['-I' + meson.current_build_dir()]
@@ -171,22 +180,26 @@ if nvshmem_available
     endif
     nvcc_args += ['-L' + nixl_lib_path]
     nvcc_args += ['-L' + nvshmem_lib_path]
+    nvcc_args += ['-L' + ompi_lib_path]
+    nvcc_args += ['-L/usr/local/lib']
     nvcc_args += ['-L' + meson.current_build_dir() + '/src/utils']
     nvcc_args += ['-L' + meson.current_build_dir() + '/src/runtime']
     nvcc_args += ['-L' + meson.current_build_dir() + '/src/worker']
-    nvcc_args += ['-lnixl', '-lnixl_build', '-lserdes', '-lgflags', '-lcuda', '-lcudart', '-lnvshmem']
+    nvcc_args += ['-lnixl', '-lnixl_build', '-lserdes', '-lgflags',  '-lamdhip64', '-lhiprtc', '-lhsa-runtime64', '-lrocshmem', '-lmpi']
+    nvcc_args += ['-Xlinker', '-rpath=/opt/rocm/lib']
+    nvcc_args += ['--hip-link', '-fgpu-rdc']
     nvcc_args += args
     nvcc_cmd_files = [
-                 meson.current_build_dir() + '/src/utils/libutils.a.p/utils.cpp.o',
-                 meson.current_build_dir() + '/src/runtime/libruntime.a.p/runtime.cpp.o',
-                 meson.current_build_dir() + '/src/worker/libworker.a.p/worker.cpp.o',
-                 meson.current_build_dir() + '/src/worker/nixl/libnixl_worker.a.p/nixl_worker.cpp.o',
-                 meson.current_build_dir() + '/src/worker/nvshmem/libnvshmemWorker.a.p/nvshmem_worker.cpp.o'
+                 meson.current_build_dir() + '/../src/utils/utils.cpp',
+                 meson.current_build_dir() + '/../src/runtime/runtime.cpp',
+                 meson.current_build_dir() + '/../src/worker/worker.cpp',
+                 meson.current_build_dir() + '/../src/worker/nixl/nixl_worker.cpp',
+                 meson.current_build_dir() + '/../src/worker/nvshmem/nvshmem_worker.cpp'
                  ]
 
     if etcd_available
         nvcc_args += ['-letcd-cpp-api', '-lcpprest']
-        etcd_rt = meson.current_build_dir() + '/src/runtime/etcd/libetcd_rt.a.p/etcd_rt.cpp.o'
+        etcd_rt = meson.current_build_dir() + '/../src/runtime/etcd/etcd_rt.cpp'
         nvcc_cmd_files += etcd_rt
     endif
 
