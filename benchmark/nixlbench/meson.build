@@ -151,7 +151,7 @@ if nvshmem_available
         '-Xlinker', '--allow-shlib-undefined',
         '-lamdhip64',
         '-lhiprtc',
-        '-g', '-O0',
+        #'-g', '-O0',
     ]
 endif
 
@@ -187,7 +187,7 @@ if nvshmem_available
     nvcc_args += ['-L' + meson.current_build_dir() + '/src/worker']
     nvcc_args += ['-lnixl', '-lnixl_build', '-lserdes', '-lgflags',  '-lamdhip64', '-lhiprtc', '-lhsa-runtime64', '-lrocshmem', '-lmpi']
     nvcc_args += ['-Xlinker', '-rpath=/opt/rocm/lib']
-    nvcc_args += ['--hip-link', '-fgpu-rdc']
+    nvcc_args += ['--hip-link', '-fgpu-rdc', '--offload-arch=gfx942']
     nvcc_args += args
     nvcc_cmd_files = [
                  meson.current_build_dir() + '/../src/utils/utils.cpp',
