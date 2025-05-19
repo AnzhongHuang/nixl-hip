@@ -51,7 +51,7 @@ class xferBenchNvshmemWorker: public xferBenchWorker {
         std::vector<std::vector<xferBenchIOV>> exchangeIOV(const std::vector<std::vector<xferBenchIOV>>
                                                            &local_iov_lists) override;
         void poll(size_t block_size) override;
-	    int synchronizeStart();
+	    int synchronizeStart() override;
 
         // Data operations
         std::variant<double, int> transfer(size_t block_size,
