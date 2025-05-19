@@ -1,0 +1,467 @@
+ARG BASE_IMAGE=rocm/dev-ubuntu-24.04
+ARG BASE_IMAGE_TAG=6.4-complete
+ARG MANYLINUX_IMAGE="quay.io/pypa/manylinux_2_28_x86_64"
+ARG HIPBLASLT_BRANCH="db8e93b4"
+ARG HIPBLAS_COMMON_BRANCH="7c1566b"
+ARG LEGACY_HIPBLASLT_OPTION=
+ARG RCCL_BRANCH="648a58d"
+ARG RCCL_REPO="https://github.com/ROCm/rccl"
+ARG TRITON_BRANCH="e5be006"
+ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
+ARG PYTORCH_BRANCH="295f2ed4"
+ARG PYTORCH_VISION_BRANCH="v0.21.0"
+ARG PYTORCH_REPO="https://github.com/pytorch/pytorch.git"
+ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
+ARG FA_BRANCH="1a7f4dfa"
+ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
+ARG AITER_BRANCH="8970b25b"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+
+FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS base
+
+ENV PATH=/opt/rocm/llvm/bin:$PATH
+ENV ROCM_PATH=/opt/rocm
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib:
+ARG PYTORCH_ROCM_ARCH=gfx942;gfx1100;gfx1200
+ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
+
+ARG PYTHON_VERSION=3.12
+
+RUN mkdir -p /app
+WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python and other dependencies
+RUN apt-get update -y && \
+    apt-get install -y software-properties-common git curl sudo vim less libgfortran5
+
+RUN add-apt-repository ppa:deadsnakes/ppa && \  
+    apt-get update -y
+    RUN apt-get update -y && apt-get -y install curl \
+    git \
+    libnuma-dev \
+    numactl \
+    wget \
+    autotools-dev \
+    automake \
+    libtool \
+    libz-dev \
+    libiberty-dev \
+    flex \
+    build-essential \
+    cmake \
+    libibverbs-dev \
+    libgoogle-glog-dev \
+    libgtest-dev \
+    libjsoncpp-dev \
+    libpython3-dev \
+    libboost-all-dev \
+    libssl-dev \
+    libgrpc-dev \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    libclang-dev \
+    protobuf-compiler-grpc \
+    pybind11-dev \
+    python3-full \
+    python3-pip \
+    python3-numpy \
+    etcd-server \
+    net-tools \
+    pciutils \
+    libpci-dev \
+    vim \
+    tmux \
+    screen \
+    ibverbs-utils \
+    libibmad-dev \
+    etcd-client \
+    etcd-server \
+    libcpprest-dev
+
+RUN git clone https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git && \
+        cd etcd-cpp-apiv3   && \
+        cmake . && \
+        make -j$(nproc) && make install
+
+# Install uv and create virtualenv
+RUN python3 -m venv /opt/dynamo/venv
+ENV PATH="/opt/dynamo/venv/bin:$PATH"
+ENV VIRTUAL_ENV=/opt/dynamo/venv
+RUN pip install --upgrade pip
+
+RUN pip install -U packaging 'cmake<4' meson ninja wheel setuptools pybind11 Cython lm_eval[api]==0.4.4
+
+FROM base AS nixl_base
+WORKDIR /opt/nixl
+# Add a cache hint that only changes when the nixl commit changes
+ARG NIXL_COMMIT
+# This line acts as a cache key - it only changes when NIXL_COMMIT changes
+RUN echo "NIXL commit: ${NIXL_COMMIT}" > /opt/nixl/commit.txt
+RUN echo "Cache bust: $CACHEBUST"
+# Copy the nixl source
+COPY --from=nixl . .
+
+FROM base AS vllm_base
+WORKDIR /opt/vllm_src
+# Add a cache hint that only changes when the vllm commit changes
+ARG VLLM_COMMIT
+# This line acts as a cache key - it only changes when VLLM_COMMIT changes
+RUN echo "VLLM commit: ${VLLM_COMMIT}" > /opt/vllm_src/commit.txt
+# Copy the nixl source
+COPY --from=vllm_src . .
+
+##################################
+########## Base Image ############
+##################################
+
+FROM nixl_base AS build_nixl
+
+USER root
+
+### NIXL SETUP ###
+RUN apt-get install -y linux-tools-common linux-tools-generic ethtool iproute2
+RUN apt-get install -y dkms linux-headers-generic
+RUN apt-get install -y meson ninja-build uuid-dev gdb
+
+ENV LIBRARY_PATH=$LIBRARY_PATH:/usr/local/lib \
+    LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+
+ARG UCX_VERSION=v1.18.0
+
+RUN cd /usr/local/src && \
+    curl -fSsL "https://github.com/openucx/ucx/releases/download/v1.18.0/ucx-1.18.0.tar.gz" | tar xz && \
+    cd ucx-1.18.0 && \
+    ./configure     \
+    --enable-shared             \
+    --disable-static            \
+    --disable-doxygen-doc       \
+    --enable-optimizations      \
+    --enable-cma                \
+    --enable-devel-headers      \
+    --with-rocm=/opt/rocm       \
+    --with-verbs                \
+    --with-dm                   \
+    --enable-mt                 \
+    --prefix=/usr/local/ucx  && \
+    make -j &&                      \
+    make -j install-strip &&        \
+    ldconfig
+
+ENV LD_LIBRARY_PATH=/usr/lib:$LD_LIBRARY_PATH
+ENV CPATH=/usr/include:$CPATH
+ENV PATH=/usr/bin:$PATH
+ENV PKG_CONFIG_PATH=/usr/lib/pkgconfig:$PKG_CONFIG_PATH
+SHELL ["/bin/bash", "-c"]
+
+WORKDIR /workspace
+
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+ENV CPATH=/opt/rocm/include:$CPATH
+ENV PATH=/opt/rocm/bin:$PATH
+ENV PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:/usr/local/ucx/lib/pkgconfig:$PKG_CONFIG_PATH
+
+# Copy nixl source, and use commit hash as cache hint
+COPY --from=nixl_base /opt/nixl /opt/nixl
+COPY --from=nixl_base /opt/nixl/commit.txt /opt/nixl/commit.txt
+RUN cd /opt/nixl && \
+    mkdir build && \
+    meson setup build/ --prefix=/usr/local/nixl \
+    -Ducx_path=/usr/local/ucx \
+    -Ddisable_gds_backend=true \
+    -Dcudapath_inc=/opt/rocm/include \
+    -Dcudapath_lib=/opt/rocm/lib && \
+    cd build/ && \
+    ninja && \
+    ninja install
+
+ENV LD_LIBRARY_PATH=/usr/local/nixl/lib/x86_64-linux-gnu/:$LD_LIBRARY_PATH
+ENV PYTHONPATH=/usr/local/nixl/lib/python3/dist-packages/:/opt/nixl/test/python/:$PYTHONPATH
+ENV UCX_TLS=^cuda_ipc
+ENV NIXL_PLUGIN_DIR=/usr/local/nixl/lib/x86_64-linux-gnu/plugins
+
+RUN ls -l /usr/local/nixl/
+RUN ls -l /usr/local/nixl/include/
+
+RUN ls /opt/nixl
+
+############################# install_torch ############################
+FROM base AS install_torch
+RUN pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm6.4/
+
+FROM install_torch AS install_vllm
+
+# Upgrade pip first
+RUN pip install --upgrade pip wheel build
+COPY --from=vllm_base /opt/vllm_src /opt/vllm_src
+RUN cd /opt/vllm_src && \
+    pip install --upgrade numba scipy huggingface-hub[cli,hf_transfer] setuptools_scm  && \
+    pip install "numpy<2"
+
+ARG VLLM_REF="0.8.4"
+ARG VLLM_PATCH="vllm_v${VLLM_REF}-dynamo-kv-disagg-patch.patch"
+ARG VLLM_PATCHED_PACKAGE_NAME="ai_dynamo_vllm"
+ARG VLLM_PATCHED_PACKAGE_VERSION="0.8.4"
+
+# Build wheel with ROCm arch specification
+RUN cd /opt/vllm_src && \
+    pip install -U -r requirements/rocm.txt && \
+    pip install /opt/rocm/share/amd_smi && \
+    PYTORCH_ROCM_ARCH="gfx942;gfx1100" VLLM_TARGET_DEVICE=rocm python3 setup.py develop bdist_wheel
+
+RUN mkdir -p /app/dist/ && \
+    mv /opt/vllm_src/dist/*.whl /app/dist/ && \
+    pip install /app/dist/*.whl
+
+############################## build_dynamo ##############################
+FROM base AS build_dynamo
+RUN mkdir -p /workspace
+# Working directory
+WORKDIR /workspace
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    CARGO_TARGET_DIR=/workspace/target
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y  
+
+# Copy Python wheel configuration files
+COPY pyproject.toml /workspace/
+COPY README.md /workspace/
+COPY LICENSE /workspace/
+COPY Cargo.toml /workspace/
+COPY Cargo.lock /workspace/
+COPY rust-toolchain.toml /workspace/
+COPY hatch_build.py /workspace/
+
+COPY lib/ /workspace/lib/
+COPY components /workspace/components
+COPY launch /workspace/launch
+
+ARG CARGO_BUILD_JOBS
+# Set CARGO_BUILD_JOBS to 16 if not provided
+# This is to prevent cargo from building $(nproc) jobs in parallel,
+# which might exceed the number of opened files limit.
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-16}
+
+ENV CARGO_TARGET_DIR=/workspace/target
+RUN mkdir -p /workspace/target  
+
+RUN cargo build --release --locked --features mistralrs,sglang,vllm,python && \
+    cargo doc --no-deps && \
+    cp target/release/dynamo-run /usr/local/bin && \
+    cp target/release/http /usr/local/bin && \
+    cp target/release/llmctl /usr/local/bin && \
+    cp target/release/metrics /usr/local/bin && \
+    cp target/release/mock_worker /usr/local/bin
+
+COPY deploy/dynamo/sdk /workspace/deploy/dynamo/sdk
+COPY deploy/dynamo/api-store /workspace/deploy/dynamo/api-store
+
+# Tell vllm to use the Dynamo LLM C API for KV Cache Routing
+ENV VLLM_KV_CAPI_PATH="/opt/dynamo/bindings/lib/libdynamo_llm_capi.so"
+
+# Copy launch banner
+RUN --mount=type=bind,source=./container/launch_message.txt,target=/workspace/launch_message.txt \
+    sed '/^#\s/d' /workspace/launch_message.txt > ~/.launch_screen && \
+    echo "cat ~/.launch_screen" >> ~/.bashrc
+
+CMD []
+
+
+###################################
+####### WHEEL BUILD STAGE #########
+###################################
+
+# Build the wheel in the manylinux environment
+FROM ${MANYLINUX_IMAGE} AS wheel_builder
+ARG CARGO_BUILD_JOBS
+# Set CARGO_BUILD_JOBS to 16 if not provided
+# This is to prevent cargo from building $(nproc) jobs in parallel,
+# which might exceed the number of opened files limit.
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-16}
+# Use build arg RELEASE_BUILD = true to generate wheels for Python 3.10, 3.11 and 3.12.
+ARG RELEASE_BUILD
+WORKDIR /workspace
+
+RUN yum update -y \
+    && yum install -y protobuf-compiler \
+    || yum install -y https://raw.repo.almalinux.org/almalinux/8.10/AppStream/x86_64/os/Packages/protobuf-3.5.0-15.el8.x86_64.rpm \
+    https://raw.repo.almalinux.org/almalinux/8.10/AppStream/x86_64/os/Packages/protobuf-compiler-3.5.0-15.el8.x86_64.rpm \
+    && yum clean all \
+    && rm -rf /var/cache/yum
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    CARGO_TARGET_DIR=/workspace/target
+
+#COPY --from=build_dynamo /workspace /workspace
+#COPY --from=build_dynamo $RUSTUP_HOME $RUSTUP_HOME
+#COPY --from=build_dynamo $CARGO_HOME $CARGO_HOME
+
+# Copy uv from build and build wheel in virtualenv
+RUN mkdir /opt/dynamo && \
+    uv venv /opt/dynamo/venv --python 3.12
+
+# Activate virtual environment
+ENV VIRTUAL_ENV=/opt/dynamo/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+ENV PATH="$PATH:/usr/local/bin"
+
+# Build dynamo wheel
+RUN source /opt/dynamo/venv/bin/activate && \
+    cd /workspace/lib/bindings/python && \
+    uv build --wheel --out-dir /workspace/dist --python 3.12 && \
+    if [ "$RELEASE_BUILD" = "true" ]; then \
+        uv build --wheel --out-dir /workspace/dist --python 3.11 && \
+        uv build --wheel --out-dir /workspace/dist --python 3.10; \
+    fi && \
+    cd /workspace && \
+    uv build --wheel --out-dir /workspace/dist
+
+###################### build_shmem ######################
+FROM build_nixl AS build_shmem
+
+# Set environment variables for OMPI installation
+ENV MPI_ROOT=/usr/local/ompi  
+ENV ROCM_PATH=/opt/rocm  
+ENV UCX_ROOT=/usr/local/ucx
+
+RUN git clone --recursive https://github.com/open-mpi/ompi.git -b v5.0.x /ompi && \
+    cd /ompi && \
+    ./autogen.pl && \
+    ./configure --prefix=${MPI_ROOT} --with-rocm=${ROCM_PATH} --with-ucx=${UCX_ROOT} && \
+    make -j 8 && \
+    make -j 8 install
+ENV CC=/opt/rocm/lib/llvm/bin/clang
+ENV CXX=/opt/rocm/lib/llvm/bin/clang++
+ENV OMPI_INSTALL_DIR=/usr/local/rocshmem
+ENV PATH="${OMPI_INSTALL_DIR}/bin:${PATH}"  
+ENV LD_LIBRARY_PATH="${OMPI_INSTALL_DIR}/lib:${LD_LIBRARY_PATH}"  
+
+COPY --from=rocshmem_src . /opt/rocshmem
+# Clone rocSHMEM repository and check out the specific tag  
+RUN rm -rf cd /opt/rocshmem/build
+RUN cd /opt/rocshmem && \
+    mkdir build && \
+    cd build && \
+    CMAKE_PREFIX_PATH="${ROCM_PATH}:${CMAKE_PREFIX_PATH}"  ../scripts/build_configs/ipc_single /usr/local/rocshmem
+
+# build bench mark
+RUN rm -rf /opt/nixl/benchmark/nixlbench/build
+RUN cd /opt/nixl/benchmark/nixlbench && \
+    meson setup build/ && \
+    cd build && \
+    ninja && \
+    ninja install
+
+
+FROM install_vllm AS deploy
+# Copy NIXL
+COPY --from=build_nixl /usr/local/nixl /usr/local/nixl
+COPY --from=build_nixl --chown=$USERNAME:$USERNAME  /usr/local/ucx /usr/local/ucx
+ENV NIXL_PLUGIN_DIR=/usr/local/nixl/lib/x86_64-linux-gnu/plugins
+
+COPY --from=build_shmem /usr/local/ompi /usr/local/ompi
+COPY --from=build_shmem /usr/local/rocshmem /usr/local/rocshmem
+COPY --from=build_shmem /usr/local/nixlbench/bin/nixlbench /usr/local/nixl/bin
+
+ENV LD_LIBRARY_PATH=/opt/rocm/lib/llvm/lib:/usr/local/ompi/lib:/usr/local/rocshmem/lib:/usr/local/ucx/lib:/usr/local/nixl/lib/x86_64-linux-gnu/:$NIXL_PLUGIN_DIR:$LD_LIBRARY_PATH
+ENV PYTHONPATH=/usr/local/nixl/lib/python3/dist-packages/:/opt/nixl/test/python/:$PYTHONPATH
+ENV UCX_TLS=^cuda_ipc
+ENV PATH="$PATH:/usr/local/ompi/bin"
+ENV DYNAMO_HOME=/workspace
+
+COPY . /workspace
+
+#######################################
+########## Local Development ##########
+#######################################
+
+FROM base AS local-dev
+
+# https://code.visualstudio.com/remote/advancedcontainers/add-nonroot-user
+# Will use the default ubuntu user, but give sudo access
+# Needed so files permissions aren't set to root ownership when writing from inside container
+
+# Don't want ubuntu to be editable, just change uid and gid. User ubuntu is hardcoded in .devcontainer
+ENV USERNAME=ubuntu
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+RUN apt-get update && apt-get install -y sudo gnupg2 gnupg1 jq\
+    && echo "$USERNAME ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
+    && chmod 0440 /etc/sudoers.d/$USERNAME \
+    && mkdir -p /home/$USERNAME \
+    && chown -R $USERNAME:$USERNAME /home/$USERNAME \
+    && rm -rf /var/lib/apt/lists/* \
+    && chsh -s /bin/bash $USERNAME
+
+COPY --from=deploy --chown=$USER_UID:$USER_GID /opt/dynamo/venv/ /opt/dynamo/venv/
+COPY --from=deploy --chown=$USERNAME:$USERNAME /usr/local/bin /usr/local/bin
+
+# Copy NIXL
+COPY --from=build_nixl --chown=$USERNAME:$USERNAME  /usr/local/nixl /usr/local/nixl
+COPY --from=build_nixl --chown=$USERNAME:$USERNAME  /usr/local/ucx /usr/local/ucx
+ENV LD_LIBRARY_PATH=/usr/local/ucx/lib:/usr/local/nixl/lib/x86_64-linux-gnu/:$LD_LIBRARY_PATH
+ENV PYTHONPATH=/usr/local/nixl/lib/python3/dist-packages/:/opt/nixl/test/python/:$PYTHONPATH
+ENV UCX_TLS=^cuda_ipc
+ENV NIXL_PLUGIN_DIR=/usr/local/nixl/lib/x86_64-linux-gnu/plugins
+
+ENV DYNAMO_HOME=/workspace
+# Activate virtual environment
+ENV VIRTUAL_ENV=/opt/dynamo/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+ENV PATH="$PATH:/usr/local/bin"
+
+USER $USERNAME
+ENV HOME=/home/$USERNAME
+WORKDIR $HOME
+
+# https://code.visualstudio.com/remote/advancedcontainers/persist-bash-history
+RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=$HOME/.commandhistory/.bash_history" \
+    && mkdir -p $HOME/.commandhistory \
+    && touch $HOME/.commandhistory/.bash_history \
+    && echo "$SNIPPET" >> "$HOME/.bashrc"
+
+RUN mkdir -p /home/$USERNAME/.cache/
+RUN mkdir -p /home/$USERNAME/app/
+#ENV VLLM_KV_CAPI_PATH=$HOME/dynamo/.build/target/debug/libdynamo_llm_capi.so
+
+#ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
+
+ARG BASE_IMAGE
+ARG BASE_IMAGE_TAG
+ARG HIPBLAS_COMMON_BRANCH
+ARG HIPBLASLT_BRANCH
+ARG LEGACY_HIPBLASLT_OPTION
+ARG RCCL_BRANCH
+ARG RCCL_REPO
+ARG TRITON_BRANCH
+ARG TRITON_REPO
+ARG PYTORCH_BRANCH
+ARG PYTORCH_VISION_BRANCH
+ARG PYTORCH_REPO
+ARG PYTORCH_VISION_REPO
+ARG FA_BRANCH
+ARG FA_REPO
+ARG AITER_BRANCH
+ARG AITER_REPO
+RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /home/$USERNAME/app/versions.txt \
+    && echo "BASE_IMAGE_TAG: ${BASE_IMAGE_TAG}" > /home/$USERNAME/app/versions.txt \
+    && echo "HIPBLAS_COMMON_BRANCH: ${HIPBLAS_COMMON_BRANCH}" >> /home/$USERNAME/app/versions.txt \
+    && echo "HIPBLASLT_BRANCH: ${HIPBLASLT_BRANCH}" >> /home/$USERNAME/app/versions.txt \
+    && echo "LEGACY_HIPBLASLT_OPTION: ${LEGACY_HIPBLASLT_OPTION}" >> /home/$USERNAME/app/versions.txt \
+    && echo "RCCL_BRANCH: ${RCCL_BRANCH}" >> /home/$USERNAME/app/versions.txt \
+    && echo "RCCL_REPO: ${RCCL_REPO}" >> /home/$USERNAME/app/versions.txt \
+    && echo "TRITON_BRANCH: ${TRITON_BRANCH}" >> /home/$USERNAME/app/versions.txt \
+    && echo "TRITON_REPO: ${TRITON_REPO}" >> /home/$USERNAME/app/versions.txt \
+    && echo "PYTORCH_BRANCH: ${PYTORCH_BRANCH}" >> /home/$USERNAME/app/versions.txt \
+    && echo "PYTORCH_VISION_BRANCH: ${PYTORCH_VISION_BRANCH}" >> /home/$USERNAME/app/versions.txt \
+    && echo "PYTORCH_REPO: ${PYTORCH_REPO}" >> /home/$USERNAME/app/versions.txt \
+    && echo "PYTORCH_VISION_REPO: ${PYTORCH_VISION_REPO}" >> /home/$USERNAME/app/versions.txt \
+    && echo "FA_BRANCH: ${FA_BRANCH}" >> /home/$USERNAME/app/versions.txt \
+    && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /home/$USERNAME/app/versions.txt \
+    && echo "AITER_REPO: ${AITER_REPO}" >> /home/$USERNAME/app/versions.txt
