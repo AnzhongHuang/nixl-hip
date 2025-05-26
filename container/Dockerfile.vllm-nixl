@@ -366,7 +366,7 @@ ENV NIXL_PLUGIN_DIR=/usr/local/nixl/lib/x86_64-linux-gnu/plugins
 
 COPY --from=build_shmem /usr/local/ompi /usr/local/ompi
 COPY --from=build_shmem /usr/local/rocshmem /usr/local/rocshmem
-COPY --from=build_shmem /usr/local/nixlbench/bin/nixlbench /usr/local/nixl/bin
+COPY --from=build_shmem /usr/local/nixlbench/bin/nixlbench /usr/local/nixl/bin/nixlbench
 
 ENV LD_LIBRARY_PATH=/opt/rocm/lib/llvm/lib:/usr/local/ompi/lib:/usr/local/rocshmem/lib:/usr/local/ucx/lib:/usr/local/nixl/lib/x86_64-linux-gnu/:$NIXL_PLUGIN_DIR:$LD_LIBRARY_PATH
 ENV PYTHONPATH=/usr/local/nixl/lib/python3/dist-packages/:/opt/nixl/test/python/:$PYTHONPATH

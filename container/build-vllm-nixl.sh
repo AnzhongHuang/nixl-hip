@@ -65,7 +65,8 @@ VLLM_BASE_IMAGE_TAG="6.4-complete"
 NONE_BASE_IMAGE="ubuntu"
 NONE_BASE_IMAGE_TAG="24.04"
 
-NIXL_COMMIT=c7cdc05bf2180bb75a2fd12faa41f07143dc9982
+#NIXL_COMMIT=c7cdc05bf2180bb75a2fd12faa41f07143dc9982
+NIXL_COMMIT=main
 NIXL_REPO=AnzhongHuang/nixl-hip.git
 
 VLLM_REPO=neuralmagic/vllm.git
@@ -394,13 +395,13 @@ if [[ $FRAMEWORK == "ROCM" ]]; then
                 git clone git@github.com:${NIXL_REPO} "$NIXL_DIR"
             fi
         fi
-    fi
 
-    cd "$NIXL_DIR" || exit
-    if ! git checkout ${NIXL_COMMIT}; then
-        echo "ERROR: Failed to checkout NIXL commit ${NIXL_COMMIT}. The cached directory may be out of date."
-        echo "Please delete $NIXL_DIR and re-run the build script."
-        exit 1
+        cd "$NIXL_DIR" || exit
+        if ! git checkout ${NIXL_COMMIT}; then
+            echo "ERROR: Failed to checkout NIXL commit ${NIXL_COMMIT}. The cached directory may be out of date."
+            echo "Please delete $NIXL_DIR and re-run the build script."
+            exit 1
+        fi
     fi
 
     BUILD_CONTEXT_ARG+=" --build-context nixl=$NIXL_DIR"
@@ -463,7 +464,7 @@ if [[ $FRAMEWORK == "TENSORRTLLM" ]]; then
     fi
 fi
 
-$RUN_PREFIX docker build -f $DOCKERFILE $TARGET_STR $PLATFORM $BUILD_ARGS $CACHE_FROM $CACHE_TO $TAG $LATEST_TAG $BUILD_CONTEXT_ARG $BUILD_CONTEXT $NO_CACHE --progress=plain 2>&1 | tee build.log
+$RUN_PREFIX docker build -f $DOCKERFILE $TARGET_STR $PLATFORM $BUILD_ARGS $CACHE_FROM $CACHE_TO $TAG $LATEST_TAG $BUILD_CONTEXT_ARG $BUILD_CONTEXT $NO_CACHE
 
 { set +x; } 2>/dev/null
 
